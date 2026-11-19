@@ -1,3 +1,4 @@
+// v15: NO RE-DEAL ON RETURN - while a hand runs, a new deal sent within 15s of a player's return is refused and the live hand is replayed to him again; return log shows what was replayed. Rest = v14.
 // v14: AWAY vs LEFT + SERVER PLAYS - when NO phone is open at the table (e.g. the only human closed the app),
 //      the server itself now bids and plays legal cards for every chair after the 12-second clock, so the hand
 //      keeps moving. Those moves are saved, so the returning player sees the table as it is now and gets
@@ -98,6 +99,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   lastDeal: any = null;
   roundLog: any[] = [];
+  lastReturnAt = 0; // v15
 
   // v11: the server's own view of the live hand (watch only in step 1)
   hands: string[][] = [[], [], [], []];
@@ -147,6 +149,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     this.onMessage("net", (client, message) => {
       if (message && message.k === "deal") {
+        // v15: a hand is still running and a player just came back -> his phone's new deal is refused (stops the re-deal)
+        if (this.phase !== "idle" && Date.now() - this.lastReturnAt < 15000) {
+          console.log(`[v15 DEAL REFUSED] Room ${this.tableCode}: hand still running, returning player keeps the live hand`);
+          if (this.lastDeal) { client.send("replay", this.lastDeal); for (const m of this.roundLog) if (m !== this.lastDeal) client.send("replay", m); }
+          return;
+        }
         this.lastDeal = message; this.roundLog = [];
         if (this.closeTimer) return; // v10: match finished - no new game on this table
       }
@@ -204,6 +212,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       seat.left = false; // v12: back in his own chair
       seat.name = playerName;
       console.log(`[PLAYER BACK] ${playerName} -> Seat ${assignedSeat} in Room ${this.tableCode}`);
+      this.lastReturnAt = Date.now(); // v15
+      console.log(`[v15 RETURN] live hand ${this.lastDeal ? "yes" : "NO"}, ${this.roundLog.length} moves to replay, phase ${this.phase}`);
     } else {
       for (let i = 0; i < 4; i++) if (!this.seats[i]) { assignedSeat = i; break; }
       if (assignedSeat < 0) throw new Error("TABLE FULL"); // v7: chairs kept for away players are never given away
