@@ -1,3 +1,4 @@
+// v16: STRICT 15-SECOND TURNS - server clock now 15 seconds to match the phones. Rest = v15.
 // v15: NO RE-DEAL ON RETURN - while a hand runs, a new deal sent within 15s of a player's return is refused and the live hand is replayed to him again; return log shows what was replayed. Rest = v14.
 // v14: AWAY vs LEFT + SERVER PLAYS - when NO phone is open at the table (e.g. the only human closed the app),
 //      the server itself now bids and plays legal cards for every chair after the 12-second clock, so the hand
@@ -83,7 +84,7 @@ const suitOf = (c: string) => c.charAt(c.length - 1);
 const rankOf = (c: string) => RANKS.indexOf(c.substring(0, c.length - 1));
 // v12: one live table per player id across the whole server: uid -> room that owns him
 const TABLE_LOCKS = new Map<string, { roomId: string; code: string }>();
-const TURN_CLOCK_MS = Number(process.env.SAM_TURN_MS) || 12 * 1000; // v11: same 12 seconds the phones use
+const TURN_CLOCK_MS = Number(process.env.SAM_TURN_MS) || 15 * 1000; // v16: same 15 seconds the phones use
 
 export class MyRoom extends Room<{ state: MyRoomState }> {
   maxClients = 4;
