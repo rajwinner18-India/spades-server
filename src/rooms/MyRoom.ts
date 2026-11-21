@@ -1,3 +1,5 @@
+// v18: BLIND SCORES ON THE SERVER - the phone tells the server about a Blind Bid (double points) or Blind Nil (+-200),
+//      so a hand finished while you were away scores the same as on your phone. Rest = v17.
 // v17: FINISHED TABLE VANISHES - the server now keeps the match score itself (bids + tricks, nil +-100, bags).
 //      When a hand ends with no phone open, the server deals the next hand itself (scores travel with the deal),
 //      and when the target is reached the table closes at once: every seat lock is freed and every phone
@@ -105,6 +107,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   lastDeal: any = null;
   roundLog: any[] = [];
   lastReturnAt = 0; // v15
+  blind: string[] = ["", "", "", ""]; // v18: "" = normal, "N" = blind nil, number = blind bid
 
   // v11: the server's own view of the live hand (watch only in step 1)
   hands: string[][] = [[], [], [], []];
@@ -157,6 +160,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     });
 
     this.onMessage("net", (client, message) => {
+      if (message && message.k === "bb") { // v18: blind choice - kept on the server only, never sent to other phones
+        const bs = Number(message.s); if (bs >= 0 && bs < 4) this.blind[bs] = String(message.v || "");
+        console.log(`[v18 BLIND] Room ${this.tableCode}: seat ${bs} blind ${message.v}`);
+        return;
+      }
       if (message && message.k === "deal") {
         // v15: a hand is still running and a player just came back -> his phone's new deal is refused (stops the re-deal)
         if (this.phase !== "idle" && Date.now() - this.lastReturnAt < 15000) {
@@ -308,7 +316,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       const deck = shuffledDeck(new NetRandom(seed));
       this.hands = [[], [], [], []];
       for (let i = 0; i < 52; i++) this.hands[(s + 1 + i) % 4].push(deck[i]);
-      this.bids = [-1, -1, -1, -1]; this.tricksWon = [0, 0, 0, 0]; this.trick = []; this.spadesBroken = false;
+      this.bids = [-1, -1, -1, -1]; this.blind = ["", "", "", ""]; this.tricksWon = [0, 0, 0, 0]; this.trick = []; this.spadesBroken = false;
       this.dealer = s; this.readScores(String(m.v || "").split(";")[1]); // v17
       if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
       this.phase = "bidding"; this.turnSeat = (s + 1) % 4;
@@ -397,24 +405,26 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   scoreState(): string {
     return [this.handNo, ...this.teamScore, ...this.teamBags, ...this.soloScore, ...this.soloBags].join(",");
   }
-  scoreOne(bid: number, won: number): [number, number] {
-    if (bid === 0) return [won === 0 ? 100 : -100, won];
-    return won >= bid ? [bid * 10 + (won - bid), won - bid] : [-bid * 10, 0];
+  scoreOne(bid: number, won: number, blind = false): [number, number] {
+    const m = blind ? 2 : 1; // v18: blind nil +-200, blind bid double points
+    if (bid === 0) return [won === 0 ? 100 * m : -100 * m, won];
+    return won >= bid ? [bid * 10 * m + (won - bid), won - bid] : [-bid * 10 * m, 0];
   }
   afterHand() {
     if (this.partners) {
       for (let t = 0; t < 2; t++) {
         const a = t, b = t + 2; let pts = 0, bags = 0;
-        for (const x of [a, b]) if (this.bids[x] === 0) { const r = this.scoreOne(0, this.tricksWon[x]); pts += r[0]; bags += r[1]; }
+        for (const x of [a, b]) if (this.bids[x] === 0) { const r = this.scoreOne(0, this.tricksWon[x], this.blind[x] === "N"); pts += r[0]; bags += r[1]; }
         const tb = (this.bids[a] > 0 ? this.bids[a] : 0) + (this.bids[b] > 0 ? this.bids[b] : 0);
         const tw = (this.bids[a] > 0 ? this.tricksWon[a] : 0) + (this.bids[b] > 0 ? this.tricksWon[b] : 0);
-        if (tb > 0) { const r = this.scoreOne(tb, tw); pts += r[0]; bags += r[1]; }
+        const tblind = (this.bids[a] > 0 && this.blind[a] !== "" && this.blind[a] !== "N") || (this.bids[b] > 0 && this.blind[b] !== "" && this.blind[b] !== "N");
+        if (tb > 0) { const r = this.scoreOne(tb, tw, tblind); pts += r[0]; bags += r[1]; }
         this.teamScore[t] += pts; this.teamBags[t] += bags;
         if (this.teamBags[t] >= 10) { this.teamBags[t] -= 10; this.teamScore[t] -= 100; }
       }
     } else {
       for (let x = 0; x < 4; x++) {
-        const r = this.scoreOne(Math.max(0, this.bids[x]), this.tricksWon[x]);
+        const r = this.scoreOne(Math.max(0, this.bids[x]), this.tricksWon[x], this.blind[x] !== "");
         this.soloScore[x] += r[0]; this.soloBags[x] += r[1];
         if (this.soloBags[x] >= 10) { this.soloBags[x] -= 10; this.soloScore[x] -= 100; }
       }
