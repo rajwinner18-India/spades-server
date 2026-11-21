@@ -1,3 +1,7 @@
+// v17: FINISHED TABLE VANISHES - the server now keeps the match score itself (bids + tricks, nil +-100, bags).
+//      When a hand ends with no phone open, the server deals the next hand itself (scores travel with the deal),
+//      and when the target is reached the table closes at once: every seat lock is freed and every phone
+//      goes to the lobby. Safety: a table that sits idle 90s after a hand with no new deal also closes. Rest = v16.
 // v16: STRICT 15-SECOND TURNS - server clock now 15 seconds to match the phones. Rest = v15.
 // v15: NO RE-DEAL ON RETURN - while a hand runs, a new deal sent within 15s of a player's return is refused and the live hand is replayed to him again; return log shows what was replayed. Rest = v14.
 // v14: AWAY vs LEFT + SERVER PLAYS - when NO phone is open at the table (e.g. the only human closed the app),
@@ -111,6 +115,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   phase: "idle" | "bidding" | "playing" = "idle";
   turnClock: any = null;
   spadesBroken = false; // v14
+  // v17: the server's own match score (server seat order)
+  handNo = 1; soloScore = [0, 0, 0, 0]; soloBags = [0, 0, 0, 0]; teamScore = [0, 0]; teamBags = [0, 0];
+  dealer = 0; partners = false; idleTimer: any = null;
 
   leavingOnPurpose = new Set<string>(); // v7: sessions that pressed LEAVE TABLE / log out
   closeTimer: any = null;               // v7: winner celebration -> close
@@ -138,6 +145,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       stakeCoins: this.stakeCoins,
       format: options.format === "partners" ? "partners" : "solo",
     });
+    this.partners = options.format === "partners"; // v17
 
     console.log(`[SPADES ROOM CREATED] ID: ${this.roomId} | Code: ${this.tableCode} | Mode: ${this.tableMode} | Stake: ${this.stakeCoins}`);
 
@@ -301,6 +309,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       this.hands = [[], [], [], []];
       for (let i = 0; i < 52; i++) this.hands[(s + 1 + i) % 4].push(deck[i]);
       this.bids = [-1, -1, -1, -1]; this.tricksWon = [0, 0, 0, 0]; this.trick = []; this.spadesBroken = false;
+      this.dealer = s; this.readScores(String(m.v || "").split(";")[1]); // v17
+      if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
       this.phase = "bidding"; this.turnSeat = (s + 1) % 4;
       console.log(`[v11 DEAL] Room ${this.tableCode} dealer ${s} seed ${seed} - seat ${this.turnSeat} bids first`);
     } else if (m.k === "bid" && this.phase === "bidding") {
@@ -320,7 +330,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
         }
         void lead; this.tricksWon[w.s]++; this.trick = []; this.turnSeat = w.s;
         if (this.hands.every((x) => x.length === 0)) { this.phase = "idle"; this.turnSeat = -1;
-          console.log(`[v11 HAND END] Room ${this.tableCode} tricks ${this.tricksWon.join("/")}`); }
+          console.log(`[v11 HAND END] Room ${this.tableCode} tricks ${this.tricksWon.join("/")}`);
+          this.afterHand(); return; } // v17
       }
     } else return;
     this.restartClock();
@@ -376,6 +387,61 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     return win.length ? low(win) : low(L);
   }
 
+  // ---- v17: match score kept on the server ----
+  readScores(st?: string) {
+    if (!st) return; const v = st.split(",").map((x) => parseInt(x, 10));
+    if (v.length < 13 || v.some((x) => isNaN(x))) return;
+    this.handNo = Math.max(1, v[0]); this.teamScore = [v[1], v[2]]; this.teamBags = [v[3], v[4]];
+    this.soloScore = v.slice(5, 9); this.soloBags = v.slice(9, 13);
+  }
+  scoreState(): string {
+    return [this.handNo, ...this.teamScore, ...this.teamBags, ...this.soloScore, ...this.soloBags].join(",");
+  }
+  scoreOne(bid: number, won: number): [number, number] {
+    if (bid === 0) return [won === 0 ? 100 : -100, won];
+    return won >= bid ? [bid * 10 + (won - bid), won - bid] : [-bid * 10, 0];
+  }
+  afterHand() {
+    if (this.partners) {
+      for (let t = 0; t < 2; t++) {
+        const a = t, b = t + 2; let pts = 0, bags = 0;
+        for (const x of [a, b]) if (this.bids[x] === 0) { const r = this.scoreOne(0, this.tricksWon[x]); pts += r[0]; bags += r[1]; }
+        const tb = (this.bids[a] > 0 ? this.bids[a] : 0) + (this.bids[b] > 0 ? this.bids[b] : 0);
+        const tw = (this.bids[a] > 0 ? this.tricksWon[a] : 0) + (this.bids[b] > 0 ? this.tricksWon[b] : 0);
+        if (tb > 0) { const r = this.scoreOne(tb, tw); pts += r[0]; bags += r[1]; }
+        this.teamScore[t] += pts; this.teamBags[t] += bags;
+        if (this.teamBags[t] >= 10) { this.teamBags[t] -= 10; this.teamScore[t] -= 100; }
+      }
+    } else {
+      for (let x = 0; x < 4; x++) {
+        const r = this.scoreOne(Math.max(0, this.bids[x]), this.tricksWon[x]);
+        this.soloScore[x] += r[0]; this.soloBags[x] += r[1];
+        if (this.soloBags[x] >= 10) { this.soloBags[x] -= 10; this.soloScore[x] -= 100; }
+      }
+    }
+    const best = Math.max(...(this.partners ? this.teamScore : this.soloScore));
+    console.log(`[v17 SCORE] Room ${this.tableCode} hand ${this.handNo}: ${this.partners ? this.teamScore.join("/") : this.soloScore.join("/")} (target ${this.targetScore})`);
+    const nobodyHere = !this.seats.some((x) => x && !x.away);
+    if (best >= this.targetScore) {
+      if (nobodyHere) { this.closeTable("match finished - target reached"); return; }
+      // a phone is open: its winner screen sends match_over; close anyway if it never comes
+      if (!this.idleTimer) this.idleTimer = setTimeout(() => this.closeTable("match finished"), 60 * 1000);
+      return;
+    }
+    this.handNo++;
+    if (nobodyHere) { setTimeout(() => { if (this.phase === "idle" && !this.closeTimer && !this.seats.some((x) => x && !x.away)) this.serverDeal(); }, 5000); return; }
+    // a phone is open and will deal; if no deal arrives within 90s the table is stuck -> close it
+    if (!this.idleTimer) this.idleTimer = setTimeout(() => { if (this.phase === "idle") this.closeTable("no new deal after the hand"); }, 90 * 1000);
+  }
+  serverDeal() {
+    const d = (this.dealer + 1) % 4; const seed = 1 + Math.floor(Math.random() * 2147483646);
+    const m = { k: "deal", s: d, v: seed + ";" + this.scoreState() };
+    console.log(`[v17 SERVER DEAL] Room ${this.tableCode}: hand ${this.handNo} (no phone open)`);
+    this.lastDeal = m; this.roundLog = [m];
+    try { this.broadcast("net", m); } catch (e) {}
+    this.watch(m);
+  }
+
   closeTable(why: string) {
     console.log(`[TABLE CLOSED] Room ${this.tableCode}: ${why}`);
     this.releaseLocks(); // v12: everyone from this table may play elsewhere now
@@ -387,6 +453,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.releaseLocks(); // v12
     if (this.closeTimer) clearTimeout(this.closeTimer);
     if (this.emptyTimer) clearTimeout(this.emptyTimer);
+    if (this.idleTimer) clearTimeout(this.idleTimer); // v17
+    if (this.turnClock) clearTimeout(this.turnClock); // v17
     if (this.turnClock) clearTimeout(this.turnClock);
     console.log(`[ROOM DISPOSED] Room ${this.tableCode} (${this.roomId}) closed.`);
   }
