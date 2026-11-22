@@ -227,7 +227,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
     // v19: welcome + replay go out when the phone says "ready". Older app builds never say it, so send anyway after 4 seconds.
     const sid = client.sessionId;
-    setTimeout(() => { if (!this.welcomed.has(sid)) this.sendWelcome(client); }, 4000);
+    setTimeout(() => {
+      // v19b: only if this phone is still connected
+      if (!this.welcomed.has(sid) && this.clients.some((c) => c.sessionId === sid)) {
+        try { this.sendWelcome(client); } catch (e) { console.log(`[v19b WELCOME] skipped: ${e}`); }
+      }
+    }, 4000);
   }
 
   // v19: welcome_table, the "AI keeps your chair" notice, and (for a returning player) the live hand
