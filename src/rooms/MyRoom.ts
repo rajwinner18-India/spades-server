@@ -1,39 +1,12 @@
-// v18: BLIND SCORES ON THE SERVER - the phone tells the server about a Blind Bid (double points) or Blind Nil (+-200),
-//      so a hand finished while you were away scores the same as on your phone. Rest = v17.
-// v17: FINISHED TABLE VANISHES - the server now keeps the match score itself (bids + tricks, nil +-100, bags).
-//      When a hand ends with no phone open, the server deals the next hand itself (scores travel with the deal),
-//      and when the target is reached the table closes at once: every seat lock is freed and every phone
-//      goes to the lobby. Safety: a table that sits idle 90s after a hand with no new deal also closes. Rest = v16.
-// v16: STRICT 15-SECOND TURNS - server clock now 15 seconds to match the phones. Rest = v15.
-// v15: NO RE-DEAL ON RETURN - while a hand runs, a new deal sent within 15s of a player's return is refused and the live hand is replayed to him again; return log shows what was replayed. Rest = v14.
-// v14: AWAY vs LEFT + SERVER PLAYS - when NO phone is open at the table (e.g. the only human closed the app),
-//      the server itself now bids and plays legal cards for every chair after the 12-second clock, so the hand
-//      keeps moving. Those moves are saved, so the returning player sees the table as it is now and gets
-//      "AI PLAYING FOR YOU - I'M BACK". AWAY (call/app closed) = chair kept, he can come back and take over.
-//      LEFT (LEAVE TABLE) = AI plays that chair to the end, no taking back. The AI only plays while at least one
-//      human (away counts, left does not) belongs to the table; with no humans the table closes at once.
-//      The next deal still comes from a phone (scores live on the phones). Rest = v13.
-// v13: TABLE LOCK ALSO BY NAME - the same refusal now works even when an app build sends no login id,
-//      because a player's name is unique and his chair is locked under his name as well. Everything else = v12.
-// v12: TABLE LOCK (Zynga rules) - LEAVE TABLE no longer frees the player: the AI plays his chair to the end and
-//      his player id stays locked to this table, so he cannot join or create any other table while at least one
-//      human is still seated here. When the LAST human presses LEAVE TABLE the table vanishes at once and every
-//      player from it is free again. A locked player can always come back into his own chair. Rest = v11.
-// v11: ALWAYS-ON TABLE STEP 1 - the server now keeps its OWN copy of the live hand (same shuffle as the phones),
-//      follows every bid and card, knows whose turn it is and runs a 12-second clock for every chair.
-//      Step 1 only WATCHES and writes to the server log - it never plays or changes anything. Rest = v10.
-// v10: UNIQUE NAME + LOBBY AFTER MATCH - name match ignores capital letters; after the winner screen the table
-//      closes in 20s and can never restart (no PLAY AGAIN); a finished table accepts no new player.
-// v9: ONE CHAIR PER PLAYER + LIVE TABLE ON RETURN - a returning player is matched by login id OR by his name,
-//     so he always gets his OWN chair back (never a second chair with the same name). On return mid-hand he gets
-//     the live hand replayed fast (his real cards + every card already played) and sees the table as it is NOW.
-// v8: CHAIR NEVER LOST - closing the app / a call / lost network NEVER frees the chair or removes the name,
-//     before OR during the game. Only LEAVE TABLE / log out frees it. A returning player keeps his name on every screen.
-// v7: KEEP MY SEAT - a player who gets a call / closes the app keeps his chair (AI plays it) and is seated back
-//     in the SAME live table when he returns; Leave Table frees the chair; the table closes itself after the
-//     winner celebration (unless the players press PLAY AGAIN). Rest = v6.
-// v6: CALM SPECTATOR - no replay to late joiners; the bot keeps their chair until the next deal (rest = v5)
-// MyRoom v5 - LATE JOIN (rest = v4)   MyRoom v4 - SAME PLAYER COUNT (rest = v3)   MyRoom v3 - LIVE TABLE moves
+// v19: SAFE JOIN + PRIVATE TABLES
+//  - A chair belongs to a player ONLY by his login id (uid). Names are never used to match chairs (two players can share a name).
+//  - Tables made with a 4-digit code are PRIVATE: Quick Match (SOLO / PARTNERS) can never seat a stranger there.
+//  - The welcome + live-hand replay are sent only after the phone says "ready" (its listeners are registered),
+//    so nothing is lost. If an older app build never says ready, the welcome is sent automatically after 4 seconds.
+//  - 4-digit code registry (TABLE_CODES) so JOIN TABLE can find private tables.
+// v18: BLIND SCORES ON THE SERVER. v17: FINISHED TABLE VANISHES + server keeps match score.
+// v16: STRICT 15-SECOND TURNS. v15: NO RE-DEAL ON RETURN. v14: SERVER PLAYS when no phone is open.
+// v12: TABLE LOCK (Zynga rules). v7-v11: keep my seat, unique names, watch-only server copy of the hand.
 import { Room, Client, CloseCode } from "colyseus";
 import { MyRoomState } from "./schema/MyRoomState.js";
 
@@ -44,16 +17,17 @@ interface PlayerSeat {
   isBot: boolean;
   avatarUrl?: string;
   coins: number;
-  uid: string;   // v7: the player's login id (same id = same chair when he comes back)
-  away: boolean; // v7: phone call / app closed - AI plays his chair until he returns
-  left?: boolean; // v12: pressed LEAVE TABLE - AI plays his chair to the end, he is still locked to this table
+  uid: string;      // the player's login id (same id = same chair when he comes back)
+  away: boolean;    // phone call / app closed - AI plays his chair until he returns
+  left?: boolean;   // pressed LEAVE TABLE - AI plays his chair to the end, he is still locked to this table
+  rejoined?: boolean; // v19: this join is a return to his own chair
 }
 
-const AWAY_TABLE_LIMIT_MS = 30 * 60 * 1000;   // v7: everyone away for 30 minutes -> table closes
-const AFTER_WINNER_CLOSE_MS = 20 * 1000;      // v10: table vanishes 20s after the winner celebration
+const AWAY_TABLE_LIMIT_MS = 30 * 60 * 1000;   // everyone away for 30 minutes -> table closes
+const AFTER_WINNER_CLOSE_MS = 20 * 1000;      // table vanishes 20s after the winner celebration
 
 
-// ---- v11: exact copy of the phones' System.Random(seed), so the server deals the very same cards ----
+// ---- exact copy of the phones' System.Random(seed), so the server deals the very same cards ----
 class NetRandom {
   private seedArray = new Array<number>(56).fill(0);
   private inext = 0; private inextp = 21;
@@ -88,13 +62,16 @@ function shuffledDeck(rng: NetRandom): string[] {
 }
 const suitOf = (c: string) => c.charAt(c.length - 1);
 const rankOf = (c: string) => RANKS.indexOf(c.substring(0, c.length - 1));
-// v12: one live table per player id across the whole server: uid -> room that owns him
+
+// one live table per player id across the whole server: uid -> room that owns him
 const TABLE_LOCKS = new Map<string, { roomId: string; code: string }>();
-const TURN_CLOCK_MS = Number(process.env.SAM_TURN_MS) || 15 * 1000; // v16: same 15 seconds the phones use
+// v19: 4-digit code -> room id (private tables are found through this list)
+export const TABLE_CODES = new Map<string, string>();
+const TURN_CLOCK_MS = Number(process.env.SAM_TURN_MS) || 15 * 1000;
 
 export class MyRoom extends Room<{ state: MyRoomState }> {
   maxClients = 4;
-  autoDispose = false; // v7: an empty-looking table (everyone on a call) must stay alive
+  autoDispose = false; // an empty-looking table (everyone on a call) must stay alive
   state = new MyRoomState();
 
   tableMode: "classic_pro" | "beat_and_laugh" = "classic_pro";
@@ -106,10 +83,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   lastDeal: any = null;
   roundLog: any[] = [];
-  lastReturnAt = 0; // v15
-  blind: string[] = ["", "", "", ""]; // v18: "" = normal, "N" = blind nil, number = blind bid
+  lastReturnAt = 0;
+  blind: string[] = ["", "", "", ""]; // "" = normal, "N" = blind nil, number = blind bid
+  welcomed = new Set<string>();       // v19: sessions that already received their welcome
 
-  // v11: the server's own view of the live hand (watch only in step 1)
+  // the server's own view of the live hand
   hands: string[][] = [[], [], [], []];
   bids: number[] = [-1, -1, -1, -1];
   tricksWon: number[] = [0, 0, 0, 0];
@@ -117,16 +95,16 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   turnSeat = -1;
   phase: "idle" | "bidding" | "playing" = "idle";
   turnClock: any = null;
-  spadesBroken = false; // v14
-  // v17: the server's own match score (server seat order)
+  spadesBroken = false;
+  // the server's own match score (server seat order)
   handNo = 1; soloScore = [0, 0, 0, 0]; soloBags = [0, 0, 0, 0]; teamScore = [0, 0]; teamBags = [0, 0];
   dealer = 0; partners = false; idleTimer: any = null;
 
-  leavingOnPurpose = new Set<string>(); // v7: sessions that pressed LEAVE TABLE / log out
-  closeTimer: any = null;               // v7: winner celebration -> close
-  emptyTimer: any = null;               // v7: everyone away -> close
+  leavingOnPurpose = new Set<string>(); // sessions that pressed LEAVE TABLE / log out
+  closeTimer: any = null;               // winner celebration -> close
+  emptyTimer: any = null;               // everyone away -> close
 
-  // "Rex|Carlos||" - empty = free chair; v7: "~Name" = chair kept for a player who is away
+  // "Rex|Carlos||" - empty = free chair; "~Name" = chair kept for a player who is away
   roster(): string {
     return this.seats.map((s) => (s ? (s.away ? "~" : "") + (s.name || "Player").replace(/[|~]/g, " ") : "")).join("|");
   }
@@ -148,9 +126,13 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       stakeCoins: this.stakeCoins,
       format: options.format === "partners" ? "partners" : "solo",
     });
-    this.partners = options.format === "partners"; // v17
+    this.partners = options.format === "partners";
 
-    console.log(`[SPADES ROOM CREATED] ID: ${this.roomId} | Code: ${this.tableCode} | Mode: ${this.tableMode} | Stake: ${this.stakeCoins}`);
+    // v19: a table made with a 4-digit code is PRIVATE - Quick Match can never put a stranger in it
+    if (options.tableCode && String(options.tableCode).length === 4) this.setPrivate(true);
+    TABLE_CODES.set(this.tableCode, this.roomId);
+
+    console.log(`[SPADES ROOM CREATED] ID: ${this.roomId} | Code: ${this.tableCode} | Mode: ${this.tableMode} | Stake: ${this.stakeCoins} | Private: ${!!options.tableCode}`);
 
     this.onMessage("play_card", (client, message) => {
       this.broadcast("card_played", { sessionId: client.sessionId, card: message.card, seatIndex: message.seatIndex });
@@ -159,33 +141,36 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       this.broadcast("bid_made", { sessionId: client.sessionId, bid: message.bid, seatIndex: message.seatIndex });
     });
 
+    // v19: the phone has registered its listeners - now it is safe to send the welcome + live hand
+    this.onMessage("ready", (client) => this.sendWelcome(client));
+
     this.onMessage("net", (client, message) => {
-      if (message && message.k === "bb") { // v18: blind choice - kept on the server only, never sent to other phones
+      if (message && message.k === "bb") { // blind choice - kept on the server only, never sent to other phones
         const bs = Number(message.s); if (bs >= 0 && bs < 4) this.blind[bs] = String(message.v || "");
         console.log(`[v18 BLIND] Room ${this.tableCode}: seat ${bs} blind ${message.v}`);
         return;
       }
       if (message && message.k === "deal") {
-        // v15: a hand is still running and a player just came back -> his phone's new deal is refused (stops the re-deal)
+        // a hand is still running and a player just came back -> his phone's new deal is refused (stops the re-deal)
         if (this.phase !== "idle" && Date.now() - this.lastReturnAt < 15000) {
           console.log(`[v15 DEAL REFUSED] Room ${this.tableCode}: hand still running, returning player keeps the live hand`);
           if (this.lastDeal) { client.send("replay", this.lastDeal); for (const m of this.roundLog) if (m !== this.lastDeal) client.send("replay", m); }
           return;
         }
         this.lastDeal = message; this.roundLog = [];
-        if (this.closeTimer) return; // v10: match finished - no new game on this table
+        if (this.closeTimer) return; // match finished - no new game on this table
       }
       if (message && message.k !== "tq") this.roundLog.push(message);
-      try { this.watch(message); } catch (e) { console.log(`[v11 WATCH] skipped: ${e}`); } // v11: never breaks the relay
+      try { this.watch(message); } catch (e) { console.log(`[v11 WATCH] skipped: ${e}`); } // never breaks the relay
       this.broadcast("net", message, { except: client });
     });
 
-    // v7: player pressed LEAVE TABLE or logged out -> his chair is really freed
+    // player pressed LEAVE TABLE or logged out -> his chair is really freed
     this.onMessage("leave_seat", (client) => {
       this.leavingOnPurpose.add(client.sessionId);
     });
 
-    // v7: winner celebration started -> table vanishes after it (cancelled if a new deal arrives)
+    // winner celebration started -> table vanishes after it (cancelled if a new deal arrives)
     this.onMessage("match_over", () => {
       if (this.closeTimer) return;
       console.log(`[MATCH OVER] Room ${this.tableCode} closes in ${AFTER_WINNER_CLOSE_MS / 1000}s`);
@@ -198,54 +183,63 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   }
 
   onJoin(client: Client, options: any) {
-    const uid = String(options.uid || "") || "dev_" + client.sessionId; // v8: every chair has an owner id
-    const playerName = options.name || `Player_${client.sessionId.substring(0, 4)}`;
+    const uid = String(options.uid || "") || "dev_" + client.sessionId; // every chair has an owner id
+    const playerName = String(options.name || `Player_${client.sessionId.substring(0, 4)}`);
 
-    // v7: same login id already owns a chair here -> sit him back in it
-    let assignedSeat = uid ? this.seats.findIndex((s) => s !== null && s.uid === uid) : -1;
-    // v9: id changed (new guest session / new connection) -> same name already owns a chair here = it is him
-    // v10: same name in any letter case = same player (user names are unique)
-    const key = String(playerName).trim().toUpperCase();
-    if (assignedSeat < 0 && options.name)
-      assignedSeat = this.seats.findIndex((s) => s !== null && String(s.name).trim().toUpperCase() === key);
+    // v19: identity = uid ONLY. Names are display text and are not unique (Google / email names can match).
+    let assignedSeat = this.seats.findIndex((s) => s !== null && s.uid === uid);
     const rejoined = assignedSeat >= 0;
-    if (!rejoined && this.closeTimer) throw new Error("TABLE FINISHED");
-    // v12: still locked to another live table -> refused (he can only go back to that one)
-    // v13: look him up by login id AND by his name, so the rule holds even if an app build sends no id
-    const lock = TABLE_LOCKS.get(uid) || (key ? TABLE_LOCKS.get("NAME:" + key) : undefined);
+
+    if (!rejoined && this.closeTimer) throw new Error("TABLE FINISHED"); // finished table takes no new players
+
+    // still locked to another live table -> refused (he can only go back to that one)
+    const lock = TABLE_LOCKS.get(uid);
     if (!rejoined && lock && lock.roomId !== this.roomId) {
       console.log(`[v12 LOCK] ${playerName} refused in ${this.tableCode} - still seated at table ${lock.code}`);
       throw new Error("ACTIVE TABLE " + lock.code);
-    } // v10: finished table takes no new players
+    }
 
     if (rejoined) {
       const seat = this.seats[assignedSeat]!;
       seat.sessionId = client.sessionId;
-      seat.uid = uid; // v9: remember his newest id
-      if (seat.uid !== uid && TABLE_LOCKS.get(seat.uid)?.roomId === this.roomId) TABLE_LOCKS.delete(seat.uid);
-      const oldName = String(seat.name).trim().toUpperCase(); // v13: his chair may be locked under his previous name
-      if (oldName && oldName !== key && TABLE_LOCKS.get("NAME:" + oldName)?.roomId === this.roomId) TABLE_LOCKS.delete("NAME:" + oldName);
       seat.away = false;
-      seat.left = false; // v12: back in his own chair
+      seat.left = false; // back in his own chair
       seat.name = playerName;
+      seat.rejoined = true;
       console.log(`[PLAYER BACK] ${playerName} -> Seat ${assignedSeat} in Room ${this.tableCode}`);
-      this.lastReturnAt = Date.now(); // v15
+      this.lastReturnAt = Date.now();
       console.log(`[v15 RETURN] live hand ${this.lastDeal ? "yes" : "NO"}, ${this.roundLog.length} moves to replay, phase ${this.phase}`);
     } else {
       for (let i = 0; i < 4; i++) if (!this.seats[i]) { assignedSeat = i; break; }
-      if (assignedSeat < 0) throw new Error("TABLE FULL"); // v7: chairs kept for away players are never given away
+      if (assignedSeat < 0) throw new Error("TABLE FULL"); // chairs kept for away players are never given away
       this.seats[assignedSeat] = {
         sessionId: client.sessionId, seatIndex: assignedSeat, name: playerName, isBot: false,
-        avatarUrl: options.avatarUrl || "", coins: Number(options.coins) || 10000, uid, away: false,
+        avatarUrl: options.avatarUrl || "", coins: Number(options.coins) || 10000, uid, away: false, rejoined: false,
       };
       console.log(`[PLAYER SEATED] ${playerName} -> Seat ${assignedSeat} (Session: ${client.sessionId}) in Room ${this.tableCode}`);
     }
     if (this.emptyTimer) { clearTimeout(this.emptyTimer); this.emptyTimer = null; }
-    TABLE_LOCKS.set(uid, { roomId: this.roomId, code: this.tableCode }); // v12
-    if (key) TABLE_LOCKS.set("NAME:" + key, { roomId: this.roomId, code: this.tableCode }); // v13: lock his name too
+    TABLE_LOCKS.set(uid, { roomId: this.roomId, code: this.tableCode });
+
+    this.broadcast("seat_updated", { seatIndex: assignedSeat, player: this.seats[assignedSeat] });
+    this.sendRoster();
+
+    // v19: welcome + replay go out when the phone says "ready". Older app builds never say it, so send anyway after 4 seconds.
+    const sid = client.sessionId;
+    setTimeout(() => { if (!this.welcomed.has(sid)) this.sendWelcome(client); }, 4000);
+  }
+
+  // v19: welcome_table, the "AI keeps your chair" notice, and (for a returning player) the live hand
+  sendWelcome(client: Client) {
+    if (this.welcomed.has(client.sessionId)) return;
+    const idx = this.seats.findIndex((s) => s && s.sessionId === client.sessionId);
+    if (idx < 0) return;
+    this.welcomed.add(client.sessionId);
+    const seat = this.seats[idx]!;
+    const rejoined = !!seat.rejoined; seat.rejoined = false;
 
     client.send("welcome_table", {
-      seatIndex: assignedSeat,
+      seatIndex: idx,
       tableCode: this.tableCode,
       tableMode: this.tableMode,
       targetScore: this.targetScore,
@@ -255,45 +249,41 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     });
 
     // hand already running -> the AI keeps this chair until the next deal, then he plays his own cards
-    if (this.lastDeal && !this.closeTimer) this.broadcast("net", { k: "dl", s: assignedSeat, v: rejoined ? "2" : "1" });
-    // v9: returning player -> replay the live hand to HIM only, so he sees his current cards and the live trick
+    if (this.lastDeal && !this.closeTimer) this.broadcast("net", { k: "dl", s: idx, v: rejoined ? "2" : "1" });
+    // returning player -> replay the live hand to HIM only
     if (rejoined && this.lastDeal && !this.closeTimer) {
       client.send("replay", this.lastDeal);
       for (const m of this.roundLog) if (m !== this.lastDeal) client.send("replay", m);
-    } // v8: "2" = returning player, his name stays
-
-    this.broadcast("seat_updated", { seatIndex: assignedSeat, player: this.seats[assignedSeat] });
-    this.sendRoster();
+    }
   }
 
   onLeave(client: Client, code: CloseCode) {
+    this.welcomed.delete(client.sessionId);
     const seatIdx = this.seats.findIndex((s) => s && s.sessionId === client.sessionId);
-    if (seatIdx < 0) return;
+    if (seatIdx < 0) return; // an old connection of a player who already came back: nothing to do
     const p = this.seats[seatIdx]!;
     const onPurpose = this.leavingOnPurpose.delete(client.sessionId);
     const matchFinished = this.closeTimer !== null;
 
     if (matchFinished) {
-      // v12: match over -> chair and player are both free
+      // match over -> chair and player are both free
       console.log(`[PLAYER LEFT] Seat ${seatIdx} (${p.name}) left finished room ${this.tableCode}`);
       if (TABLE_LOCKS.get(p.uid)?.roomId === this.roomId) TABLE_LOCKS.delete(p.uid);
-      const fn = String(p.name).trim().toUpperCase(); // v13: release the name lock as well
-      if (fn && TABLE_LOCKS.get("NAME:" + fn)?.roomId === this.roomId) TABLE_LOCKS.delete("NAME:" + fn);
       this.seats[seatIdx] = null;
       this.broadcast("seat_vacated", { seatIndex: seatIdx });
     } else if (onPurpose) {
-      // v12: LEAVE TABLE -> AI plays his chair to the end; he stays locked to this table
+      // LEAVE TABLE -> AI plays his chair to the end; he stays locked to this table
       console.log(`[v12 LEFT TABLE] Seat ${seatIdx} (${p.name}) - AI plays to the end, player locked to ${this.tableCode}`);
       p.away = true; p.left = true;
     } else {
-      // v7: call / app closed / network drop -> keep the chair, AI plays it
+      // call / app closed / network drop -> keep the chair, AI plays it
       console.log(`[PLAYER AWAY] Seat ${seatIdx} (${p.name}) - chair kept, AI plays in room ${this.tableCode}`);
       p.away = true;
     }
     this.sendRoster();
-    if (!this.seats.some((s) => s && !s.away)) this.restartClock(); // v14: last phone closed -> the server clock takes over
+    if (!this.seats.some((s) => s && !s.away)) this.restartClock(); // last phone closed -> the server clock takes over
 
-    // v12: humans = everyone seated who did NOT press LEAVE TABLE (a call / closed app still counts as a human)
+    // humans = everyone seated who did NOT press LEAVE TABLE (a call / closed app still counts as a human)
     const humansLeft = this.seats.some((s) => s && !s.left);
     const anyoneConnected = this.seats.some((s) => s && !s.away);
     if (!humansLeft) this.closeTable("every human left the table");
@@ -301,12 +291,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       this.emptyTimer = setTimeout(() => this.closeTable("everyone away too long"), AWAY_TABLE_LIMIT_MS);
   }
 
-  // v12: free every player id that this table was holding
+  // free every player id that this table was holding
   releaseLocks() {
     for (const [uid, l] of TABLE_LOCKS) if (l.roomId === this.roomId) TABLE_LOCKS.delete(uid);
   }
 
-  // ---- v11: follow the live hand (watch only - nothing is sent to the phones) ----
+  // ---- follow the live hand (nothing is sent to the phones from here) ----
   watch(m: any) {
     if (!m || typeof m.k !== "string") return;
     const s = Number(m.s);
@@ -317,7 +307,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       this.hands = [[], [], [], []];
       for (let i = 0; i < 52; i++) this.hands[(s + 1 + i) % 4].push(deck[i]);
       this.bids = [-1, -1, -1, -1]; this.blind = ["", "", "", ""]; this.tricksWon = [0, 0, 0, 0]; this.trick = []; this.spadesBroken = false;
-      this.dealer = s; this.readScores(String(m.v || "").split(";")[1]); // v17
+      this.dealer = s; this.readScores(String(m.v || "").split(";")[1]);
       if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
       this.phase = "bidding"; this.turnSeat = (s + 1) % 4;
       console.log(`[v11 DEAL] Room ${this.tableCode} dealer ${s} seed ${seed} - seat ${this.turnSeat} bids first`);
@@ -339,7 +329,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
         void lead; this.tricksWon[w.s]++; this.trick = []; this.turnSeat = w.s;
         if (this.hands.every((x) => x.length === 0)) { this.phase = "idle"; this.turnSeat = -1;
           console.log(`[v11 HAND END] Room ${this.tableCode} tricks ${this.tricksWon.join("/")}`);
-          this.afterHand(); return; } // v17
+          this.afterHand(); return; }
       }
     } else return;
     this.restartClock();
@@ -359,7 +349,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     }, TURN_CLOCK_MS);
   }
 
-  // v14: the server makes the move for this chair and tells every phone (saved for anyone who comes back)
+  // the server makes the move for this chair and tells every phone (saved for anyone who comes back)
   serverMove(seat: number) {
     let m: any = null;
     if (this.phase === "bidding") m = { k: "bid", s: seat, v: String(this.botBid(this.hands[seat])) };
@@ -368,7 +358,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     console.log(`[v14 SERVER AI] Room ${this.tableCode}: ${m.k} ${m.v} for seat ${seat} (no phone open)`);
     this.roundLog.push(m);
     try { this.broadcast("net", m); } catch (e) {}
-    this.watch(m); // updates the server copy and starts the next 12-second clock
+    this.watch(m); // updates the server copy and starts the next clock
   }
 
   botBid(h: string[]): number {
@@ -395,7 +385,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     return win.length ? low(win) : low(L);
   }
 
-  // ---- v17: match score kept on the server ----
+  // ---- match score kept on the server ----
   readScores(st?: string) {
     if (!st) return; const v = st.split(",").map((x) => parseInt(x, 10));
     if (v.length < 13 || v.some((x) => isNaN(x))) return;
@@ -406,7 +396,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     return [this.handNo, ...this.teamScore, ...this.teamBags, ...this.soloScore, ...this.soloBags].join(",");
   }
   scoreOne(bid: number, won: number, blind = false): [number, number] {
-    const m = blind ? 2 : 1; // v18: blind nil +-200, blind bid double points
+    const m = blind ? 2 : 1; // blind nil +-200, blind bid double points
     if (bid === 0) return [won === 0 ? 100 * m : -100 * m, won];
     return won >= bid ? [bid * 10 * m + (won - bid), won - bid] : [-bid * 10 * m, 0];
   }
@@ -454,17 +444,17 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   closeTable(why: string) {
     console.log(`[TABLE CLOSED] Room ${this.tableCode}: ${why}`);
-    this.releaseLocks(); // v12: everyone from this table may play elsewhere now
+    this.releaseLocks(); // everyone from this table may play elsewhere now
     try { this.broadcast("table_closed", { why }); } catch (e) {}
     this.disconnect();
   }
 
   onDispose() {
-    this.releaseLocks(); // v12
+    this.releaseLocks();
+    if (TABLE_CODES.get(this.tableCode) === this.roomId) TABLE_CODES.delete(this.tableCode); // v19
     if (this.closeTimer) clearTimeout(this.closeTimer);
     if (this.emptyTimer) clearTimeout(this.emptyTimer);
-    if (this.idleTimer) clearTimeout(this.idleTimer); // v17
-    if (this.turnClock) clearTimeout(this.turnClock); // v17
+    if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.turnClock) clearTimeout(this.turnClock);
     console.log(`[ROOM DISPOSED] Room ${this.tableCode} (${this.roomId}) closed.`);
   }
