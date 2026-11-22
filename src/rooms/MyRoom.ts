@@ -1,3 +1,5 @@
+// v117: SERVER AI LIKE A PERSON - no phone open: bots think 2-8 s; an away player keeps 2 full 15 s card turns, then 2-8 s until he is back.
+// v20d: the log now shows the time left for a returning player ([v20d TURN] / [v20d CLOCK KEPT]).
 // v20c: REAL-CLOCK TURNS - pausing never refills the 15-second bid or card timer.
 // v19: SAFE JOIN + PRIVATE TABLES
 //  - A chair belongs to a player ONLY by his login id (uid). Names are never used to match chairs (two players can share a name).
@@ -96,6 +98,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   turnSeat = -1;
   phase: "idle" | "bidding" | "playing" = "idle";
   turnClock: any = null;
+  awayTurns = [0, 0, 0, 0]; // v117: card turns the server already waited in full for a player who is away (2 full chances, then natural timing)
   turnDeadline = 0; // v20: real time (ms) when the current turn runs out - told to a returning phone so pausing never gives extra time
   spadesBroken = false;
   // the server's own match score (server seat order)
@@ -208,6 +211,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       seat.left = false; // back in his own chair
       seat.name = playerName;
       seat.rejoined = true;
+      this.awayTurns[assignedSeat] = 0; // v117: he is back - the next time he leaves he gets 2 fresh full chances
       console.log(`[PLAYER BACK] ${playerName} -> Seat ${assignedSeat} in Room ${this.tableCode}`);
       this.lastReturnAt = Date.now();
       console.log(`[v15 RETURN] live hand ${this.lastDeal ? "yes" : "NO"}, ${this.roundLog.length} moves to replay, phase ${this.phase}`);
@@ -245,6 +249,14 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     const seat = this.seats[idx]!;
     const rejoined = !!seat.rejoined; seat.rejoined = false;
 
+    // v20d: how many milliseconds of the running turn are really left (also written to the log so it can be checked)
+    const turnLeftNow = (() => {
+      if (this.turnDeadline <= 0) return -1;
+      const raw = Math.max(0, this.turnDeadline - Date.now());
+      const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
+      return firstBid ? Math.min(TURN_CLOCK_MS, raw) : raw; // a returning player skips the deal animation
+    })();
+    console.log(`[v20d TURN] Room ${this.tableCode}: welcome to seat ${idx} - turn of seat ${this.phase === "idle" ? -1 : this.turnSeat}, ${turnLeftNow} ms left, returning ${rejoined}`);
     client.send("welcome_table", {
       seatIndex: idx,
       tableCode: this.tableCode,
@@ -256,12 +268,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       // v20: whose turn it is and how many milliseconds are really left (-1 = no running turn)
       turnSeat: this.phase === "idle" ? -1 : this.turnSeat,
       // v20c: a returning player skips the deal animation, so his first bid never gets more than 15 seconds
-      turnLeftMs: (() => {
-        if (this.turnDeadline <= 0) return -1;
-        const raw = Math.max(0, this.turnDeadline - Date.now());
-        const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
-        return firstBid ? Math.min(TURN_CLOCK_MS, raw) : raw;
-      })(),
+      turnLeftMs: turnLeftNow,
     });
 
     // hand already running -> the AI keeps this chair until the next deal, then he plays his own cards
@@ -359,7 +366,15 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     // v20: the very first bid also covers the deal animation + blind choice on the phones (about 20 seconds more)
     const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
     // v20c: ONE clock - the deadline told to phones and the server's own timer are the same length
-    const duration = firstBid ? 10000 + TURN_CLOCK_MS : TURN_CLOCK_MS;
+    let duration = firstBid ? 10000 + TURN_CLOCK_MS : TURN_CLOCK_MS;
+    // v117: when no phone is open the SERVER plays like a person: an empty (bot) chair thinks 2-8 seconds,
+    // and a player who is away keeps his full 15 seconds for 2 card turns, then the server plays his chair in 2-8 seconds too
+    if (!this.seats.some((x) => x && !x.away)) {
+      const chair = this.seats[seat];
+      const natural = 2000 + Math.floor(Math.random() * 6000);
+      if (!chair) duration = natural;
+      else if (this.awayTurns[seat] >= 2) duration = natural;
+    }
     this.turnDeadline = Date.now() + duration;
     this.turnClock = setTimeout(() => this.clockFired(seat, phase), duration);
   }
@@ -381,6 +396,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     if (this.turnClock) { clearTimeout(this.turnClock); this.turnClock = null; }
     const seat = this.turnSeat, phase = this.phase;
     const wait = Math.max(500, this.turnDeadline - Date.now());
+    console.log(`[v20d CLOCK KEPT] Room ${this.tableCode}: last phone closed, seat ${seat} keeps its old deadline (${wait} ms left)`);
     this.turnClock = setTimeout(() => this.clockFired(seat, phase), wait);
   }
 
@@ -390,6 +406,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     if (this.phase === "bidding") m = { k: "bid", s: seat, v: String(this.botBid(this.hands[seat])) };
     else if (this.phase === "playing") { const c = this.botCard(this.hands[seat]); if (c) m = { k: "card", s: seat, v: c }; }
     if (!m) return;
+    const awayChair = this.seats[seat];
+    if (awayChair && m.k === "card") this.awayTurns[seat]++; // v117: one more full chance used up
     console.log(`[v14 SERVER AI] Room ${this.tableCode}: ${m.k} ${m.v} for seat ${seat} (no phone open)`);
     this.roundLog.push(m);
     try { this.broadcast("net", m); } catch (e) {}
