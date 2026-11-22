@@ -1,3 +1,4 @@
+// v20c: REAL-CLOCK TURNS - pausing never refills the 15-second bid or card timer.
 // v19: SAFE JOIN + PRIVATE TABLES
 //  - A chair belongs to a player ONLY by his login id (uid). Names are never used to match chairs (two players can share a name).
 //  - Tables made with a 4-digit code are PRIVATE: Quick Match (SOLO / PARTNERS) can never seat a stranger there.
@@ -254,7 +255,13 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       rejoined,
       // v20: whose turn it is and how many milliseconds are really left (-1 = no running turn)
       turnSeat: this.phase === "idle" ? -1 : this.turnSeat,
-      turnLeftMs: this.turnDeadline > 0 ? Math.max(0, this.turnDeadline - Date.now()) : -1,
+      // v20c: a returning player skips the deal animation, so his first bid never gets more than 15 seconds
+      turnLeftMs: (() => {
+        if (this.turnDeadline <= 0) return -1;
+        const raw = Math.max(0, this.turnDeadline - Date.now());
+        const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
+        return firstBid ? Math.min(TURN_CLOCK_MS, raw) : raw;
+      })(),
     });
 
     // hand already running -> the AI keeps this chair until the next deal, then he plays his own cards
@@ -290,7 +297,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       p.away = true;
     }
     this.sendRoster();
-    if (!this.seats.some((s) => s && !s.away)) this.restartClock(); // last phone closed -> the server clock takes over
+    if (!this.seats.some((s) => s && !s.away)) this.keepClockForServer(); // last phone closed -> the server clock takes over (v20b: with the SAME deadline, never a fresh 15 seconds)
 
     // humans = everyone seated who did NOT press LEAVE TABLE (a call / closed app still counts as a human)
     const humansLeft = this.seats.some((s) => s && !s.left);
@@ -351,15 +358,30 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     const seat = this.turnSeat, phase = this.phase;
     // v20: the very first bid also covers the deal animation + blind choice on the phones (about 20 seconds more)
     const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
-    this.turnDeadline = Date.now() + TURN_CLOCK_MS + (firstBid ? 20000 : 0);
-    this.turnClock = setTimeout(() => {
-      this.turnClock = null;
-      if (this.turnSeat !== seat || this.phase !== phase) return;
-      const nobodyHere = !this.seats.some((x) => x && !x.away);
-      const humans = this.seats.some((x) => x && !x.left);
-      if (!nobodyHere || !humans) return; // a phone is open: its AI plays as before
-      this.serverMove(seat);
-    }, TURN_CLOCK_MS);
+    // v20c: ONE clock - the deadline told to phones and the server's own timer are the same length
+    const duration = firstBid ? 10000 + TURN_CLOCK_MS : TURN_CLOCK_MS;
+    this.turnDeadline = Date.now() + duration;
+    this.turnClock = setTimeout(() => this.clockFired(seat, phase), duration);
+  }
+
+  clockFired(seat: number, phase: string) {
+    this.turnClock = null;
+    if (this.turnSeat !== seat || this.phase !== phase) return;
+    const nobodyHere = !this.seats.some((x) => x && !x.away);
+    const humans = this.seats.some((x) => x && !x.left);
+    if (!nobodyHere || !humans) return; // a phone is open: its AI plays as before
+    this.serverMove(seat);
+  }
+
+  // v20b: the last phone just closed (pause / call / app closed). The turn keeps its ORIGINAL deadline.
+  // (Before this fix the clock was restarted here, so every pause gave a brand new 15 seconds.)
+  keepClockForServer() {
+    if (this.turnSeat < 0 || this.closeTimer) return;
+    if (this.turnDeadline <= 0) { this.restartClock(); return; } // no turn was running yet
+    if (this.turnClock) { clearTimeout(this.turnClock); this.turnClock = null; }
+    const seat = this.turnSeat, phase = this.phase;
+    const wait = Math.max(500, this.turnDeadline - Date.now());
+    this.turnClock = setTimeout(() => this.clockFired(seat, phase), wait);
   }
 
   // the server makes the move for this chair and tells every phone (saved for anyone who comes back)
