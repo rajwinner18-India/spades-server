@@ -11,18 +11,19 @@ import {
 /**
  * Import your Room files
  */
-import { MyRoom } from "./rooms/MyRoom.js";
+import { MyRoom, TABLE_CODES } from "./rooms/MyRoom.js";
 
 const server = defineServer({
 
   /**
-   * v4: Quick Match fix - removed tableCode from filter so Solo players share one table
+   * v5: SAFE MATCHING
    * - SOLO players only meet SOLO players, PARTNERS only meet PARTNERS
-   * - CLASSIC PRO only meets CLASSIC PRO, BEAT & LAUGH only meets BEAT & LAUGH
-   * - Private CREATE TABLE tables (with a 4-digit code) are never joined by Quick Match
+   * - CLASSIC PRO only meets CLASSIC PRO
+   * - the same entry stake and target score only (nobody is seated at a table with a different stake)
+   * - tables made with a 4-digit code are PRIVATE (see MyRoom.ts), so Quick Match never joins them
    */
   rooms: {
-    my_room: defineRoom(MyRoom).filterBy(["mode", "format"]),
+    my_room: defineRoom(MyRoom).filterBy(["mode", "format", "stakeCoins", "targetScore"]),
   },
 
   routes: createRouter({
@@ -39,10 +40,24 @@ const server = defineServer({
 
     // JOIN TABLE by 4-digit code: Unity asks "/find/1458" and gets the live table back
     app.get("/find/:code", async (req, res) => {
-      const rooms = await matchMaker.query({ name: "my_room" });
-      const r = rooms.find((x: any) => x.metadata && x.metadata.tableCode === req.params.code);
-      if (!r) return res.json({ found: false });
-      res.json({ found: true, roomId: r.roomId, full: r.clients >= r.maxClients, ...r.metadata });
+      try {
+        const code = String(req.params.code);
+        let rooms: any[] = await matchMaker.query({ name: "my_room" });
+        let r = rooms.find((x: any) => x.metadata && x.metadata.tableCode === code);
+        if (!r) {
+          // private tables are found through the code list
+          const roomId = TABLE_CODES.get(code);
+          if (roomId) {
+            rooms = await matchMaker.query({ roomId });
+            r = rooms[0];
+          }
+        }
+        if (!r) return res.json({ found: false });
+        res.json({ found: true, roomId: r.roomId, full: r.clients >= r.maxClients, ...r.metadata });
+      } catch (e) {
+        console.log("[/find] error: " + e);
+        res.json({ found: false });
+      }
     });
 
     if (process.env.NODE_ENV !== "production") {
