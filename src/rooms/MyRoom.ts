@@ -95,6 +95,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   turnSeat = -1;
   phase: "idle" | "bidding" | "playing" = "idle";
   turnClock: any = null;
+  turnDeadline = 0; // v20: real time (ms) when the current turn runs out - told to a returning phone so pausing never gives extra time
   spadesBroken = false;
   // the server's own match score (server seat order)
   handNo = 1; soloScore = [0, 0, 0, 0]; soloBags = [0, 0, 0, 0]; teamScore = [0, 0]; teamBags = [0, 0];
@@ -246,6 +247,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       stakeCoins: this.stakeCoins,
       names: this.roster(),
       rejoined,
+      // v20: whose turn it is and how many milliseconds are really left (-1 = no running turn)
+      turnSeat: this.phase === "idle" ? -1 : this.turnSeat,
+      turnLeftMs: this.turnDeadline > 0 ? Math.max(0, this.turnDeadline - Date.now()) : -1,
     });
 
     // hand already running -> the AI keeps this chair until the next deal, then he plays his own cards
@@ -337,8 +341,12 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   restartClock() {
     if (this.turnClock) { clearTimeout(this.turnClock); this.turnClock = null; }
+    this.turnDeadline = 0;
     if (this.turnSeat < 0 || this.closeTimer) return;
     const seat = this.turnSeat, phase = this.phase;
+    // v20: the very first bid also covers the deal animation + blind choice on the phones (about 20 seconds more)
+    const firstBid = this.phase === "bidding" && this.bids.every((b) => b < 0);
+    this.turnDeadline = Date.now() + TURN_CLOCK_MS + (firstBid ? 20000 : 0);
     this.turnClock = setTimeout(() => {
       this.turnClock = null;
       if (this.turnSeat !== seat || this.phase !== phase) return;
